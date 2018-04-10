@@ -18,17 +18,18 @@ open Language
                                                    
 (* The type for the stack machine program *)                                                               
 type prg = insn list
-                            
+
 (* The type for the stack machine configuration: control stack, stack and configuration from statement
    interpreter
  *)
-type config = (prg * State.t) list * int list * Expr.config
+type config = (prg * State.t) list * int list * Stmt.config
 
 (* Stack machine interpreter
      val eval : env -> config -> prg -> config
    Takes an environment, a configuration and a program, and returns a configuration as a result. The
    environment is used to locate a label to jump to (via method env#labeled <label_name>)
-*)                                                  
+*)                         
+
 let rec eval env conf prog = 
 	match prog with
 	| instr::p -> (
@@ -78,18 +79,19 @@ let rec eval env conf prog =
 		| (cstack, stack, (st, input, output)), END -> (
 			match cstack with
 			| (p', st')::cstack' -> 
-				eval env (cstack', stack, (State.leave st st', input, output)) p'
+				eval env (cstack', stack, (State.leave st' st, input, output)) p'
 			| [] -> conf
 		)
 
 	)
 	| [] -> conf
+
+
 (* Top-level evaluation
      val run : prg -> int list -> int list
    Takes a program, an input stream, and returns an output stream this program calculates
 *)
 let run p i =
-  (*print_prg p;*)
   let module M = Map.Make (String) in
   let rec make_map m = function
   | []              -> m
@@ -104,14 +106,14 @@ let run p i =
    Takes a program in the source language and returns an equivalent program for the
    stack machine
 *)
+
+
 let rec compileExpr expr = 
 	match expr with
 	| Expr.Const value -> [CONST value]
 	| Expr.Var variable -> [LD variable]
 	| Expr.Binop (operation, left, right) ->
 		compileExpr left @ compileExpr right @ [BINOP operation]
-	| Expr.Call (name, args) ->
-		List.concat (List.map compileExpr (List.rev args)) @ [CALL name]
 
 let rec compileControl stmt env = 
 		match stmt with
@@ -139,11 +141,7 @@ let rec compileControl stmt env =
 		let repeat_body, env = compileControl repeat_stmt env in
 		[LABEL label_loop] @ repeat_body @ compileExpr expr @ [CJMP ("z", label_loop)], env
 	| Stmt.Call (name, args) ->
-		List.concat (List.map compileExpr (List.rev args)) @ [CALL name], env
-	| Stmt.Return expr ->
-		match expr with
-		| None -> [END], env
-		| Some expr -> compileExpr expr @ [END], env
+		List.concat (List.map compileExpr args) @ [CALL name], env
 
 let compile (defs, stmt) = 
 	let env = 
