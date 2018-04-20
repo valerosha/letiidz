@@ -1,161 +1,254 @@
-open GT       
-open Language
-       
-(* The type for the stack machine instructions *)
-@type insn =
-(* binary operator                 *) | BINOP of string
-(* put a constant on the stack     *) | CONST of int                 
-(* read to stack                   *) | READ
-(* write from stack                *) | WRITE
-(* load a variable to the stack    *) | LD    of string
-(* store a variable from the stack *) | ST    of string
-(* a label                         *) | LABEL of string
-(* unconditional jump              *) | JMP   of string                                                                                                                
-(* conditional jump                *) | CJMP  of string * string
-(* begins procedure definition     *) | BEGIN of string list * string list
-(* end procedure definition        *) | END
-(* calls a procedure               *) | CALL  of string with show
-                                                   
-(* The type for the stack machine program *)                                                               
-type prg = insn list
-
-(* The type for the stack machine configuration: control stack, stack and configuration from statement
-   interpreter
- *)
-type config = (prg * State.t) list * int list * Stmt.config
-
-(* Stack machine interpreter
-     val eval : env -> config -> prg -> config
-   Takes an environment, a configuration and a program, and returns a configuration as a result. The
-   environment is used to locate a label to jump to (via method env#labeled <label_name>)
-*)                         
-
-let rec eval env conf prog = 
-	match prog with
-	| instr::p -> (
-		match conf, instr with
-		| (cstack, y::x::stack, stmt_conf), BINOP operation -> 
-			let value = Expr.binop operation x y in
-			eval env (cstack, value::stack, stmt_conf) p
-		| (cstack, stack, stmt_conf), CONST value ->
-			eval env (cstack, value::stack, stmt_conf) p
-		| (cstack, stack, (st, z::input, output)), READ ->
-			eval env (cstack, z::stack, (st, input, output)) p
-		| (cstack, z::stack, (st, input, output)), WRITE ->
-			eval env (cstack, stack, (st, input, output @ [z])) p
-		| (cstack, stack, (st, input, output)), LD variable ->
-			let value = 
-				State.eval st variable in
-			eval env (cstack, value::stack, (st, input, output)) p
-		| (cstack, z::stack, (st, input, output)), ST variable ->
-			let st' =
-				State.update variable z st in
-			eval env (cstack, stack, (st', input, output)) p
-		| conf, LABEL label ->
-			 eval env conf p
-		| conf, JMP label ->
-			eval env conf (env#labeled label)
-		| (cstack, z::stack, stmt_conf), CJMP (suf, label) -> (
-			match suf with
-			| "z" -> 
-				if z == 0 then eval env (cstack, stack, stmt_conf) (env#labeled label)
-				else eval env (cstack, stack, stmt_conf) p
-			| "nz" -> 
-				if z <> 0 then eval env (cstack, stack, stmt_conf) (env#labeled label)
-				else eval env (cstack, stack, stmt_conf) p
-			| _ -> failwith("Undefined suffix!")
-		)
-		| (cstack, stack, (st, input, output)), CALL name ->
-			eval env ((p, st)::cstack, stack,(st, input, output)) (env#labeled name)
-		| (cstack, stack, (st, input, output)), BEGIN (args, locals) ->
-			let rec associate st args stack = 
-				match args, stack with
-				| arg::args', z::stack' -> 
-					let st', stack'' = associate st args' stack' in
-					(State.update arg z st', stack'')
-				| [], stack' -> (st, stack') in
-			let st', stack' = associate (State.enter st (args @ locals)) args stack in
-			eval env (cstack, stack',(st',input, output)) p
-		| (cstack, stack, (st, input, output)), END -> (
-			match cstack with
-			| (p', st')::cstack' -> 
-				eval env (cstack', stack, (State.leave st' st, input, output)) p'
-			| [] -> conf
-		)
-
-	)
-	| [] -> conf
-
-
-(* Top-level evaluation
-     val run : prg -> int list -> int list
-   Takes a program, an input stream, and returns an output stream this program calculates
+(* Opening a library for generic programming (https://github.com/dboulytchev/GT).
+   The library provides "@type ..." syntax extension and plugins like show, etc.
 *)
-let run p i =
+open GT
+
+(* Opening a library for combinator-based syntax analysis *)
+open Ostap
+open Combinators
+                         
+(* States *)
+module State =
+  struct
+                                                                
+    (* State: global state, local state, scope variables *)
+    type t = {g : string -> int; l : string -> int; scope : string list}
+
+    (* Empty state *)
+    let empty =
+      let e x = failwith (Printf.sprintf "Undefined variable: %s" x) in
+      {g = e; l = e; scope = []}
+
+    (* Update: non-destructively "modifies" the state s by binding the variable x 
+       to value v and returns the new state w.r.t. a scope
+    *)
+    let update x v s =
+      let u x v s = fun y -> if x = y then v else s y in
+      if List.mem x s.scope then {s with l = u x v s.l} else {s with g = u x v s.g}
+
+    (* Evals a variable in a state w.r.t. a scope *)
+    let eval s x = (if List.mem x s.scope then s.l else s.g) x
+
+    (* Creates a new scope, based on a given state *)
+    let enter st xs = {empty with g = st.g; scope = xs}
+
+    (* Drops a scope *)
+    let leave st st' = {st' with g = st.g}
+
+  end
+    
+(* Simple expressions: syntax and semantics *)
+module Expr =
+  struct
+    
+    (* The type for expressions. Note, in regular OCaml there is no "@type..." 
+       notation, it came from GT. 
+    *)
+    @type t =
+    (* integer constant *) | Const of int
+    (* variable         *) | Var   of string
+    (* binary operator  *) | Binop of string * t * t
+    (* function call    *) | Call  of string * t list with show
+
+    (* Available binary operators:
+        !!                   --- disjunction
+        &&                   --- conjunction
+        ==, !=, <=, <, >=, > --- comparisons
+        +, -                 --- addition, subtraction
+        *, /, %              --- multiplication, division, reminder
+    *)
+
+    (* The type of configuration: a state, an input stream, an output stream, an optional value *)
+    type config = State.t * int list * int list * int option
+                          
+    let binop op left_expr_eval right_expr_eval =
+      match op with
+      | "+" -> left_expr_eval + right_expr_eval
+      | "-" -> left_expr_eval - right_expr_eval
+      | "*" -> left_expr_eval * right_expr_eval
+      | "/" -> left_expr_eval / right_expr_eval
+      | "%" -> left_expr_eval mod right_expr_eval
+      | ">" -> if (left_expr_eval > right_expr_eval) then 1 else 0
+      | "<" -> if (left_expr_eval < right_expr_eval) then 1 else 0
+      | "<=" -> if (left_expr_eval <= right_expr_eval) then 1 else 0
+      | ">=" -> if (left_expr_eval >= right_expr_eval) then 1 else 0
+      | "==" -> if (left_expr_eval = right_expr_eval) then 1 else 0
+      | "!=" -> if (left_expr_eval <> right_expr_eval) then 1 else 0
+      | "&&" -> if ((left_expr_eval <> 0) && (right_expr_eval <> 0)) then 1 else 0
+      | "!!" -> if ((left_expr_eval <> 0) || (right_expr_eval <> 0)) then 1 else 0
+
+    (* Expression evaluator
+          val eval : env -> config -> t -> config
+       Takes an environment, a configuration and an expresion, and returns another configuration. The 
+       environment supplies the following method
+           method definition : env -> string -> int list -> config -> config
+       which takes an environment (of the same type), a name of the function, a list of actual parameters and a configuration, 
+       an returns resulting configuration
+    *)                                                       
+    let rec eval env ((st, i, o, r) as conf) expr =
+      match expr with
+      | Const c -> (st, i, o, Some c)
+      | Var x -> (st, i, o, Some (State.eval st x))
+      | Binop(op, left_expr, right_expr) ->
+        let (_, _, _, Some left_expr_eval) as conf' = eval env conf left_expr in
+        let (st', i', o', Some right_expr_eval) = eval env conf' right_expr in
+          (st', i', o', Some (binop op left_expr_eval right_expr_eval))
+      | Call (name, args) -> (
+        let v_args, conf' =
+          List.fold_left (
+            fun (acc, conf) e -> 
+              let (_, _, _, Some v) as conf' = eval env conf e in 
+              v::acc, conf'
+          ) ([], conf) args
+        in
+        env#definition env name (List.rev v_args) conf'  
+      )
+
+    let ostap_binop_list op_list = 
+      let ostap_binop op = (ostap ($(op)), fun x y -> Binop (op, x, y)) in 
+      List.map ostap_binop op_list;; 
+         
+    (* Expression parser. You can use the following terminals:
+         IDENT   --- a non-empty identifier a-zA-Z[a-zA-Z0-9_]* as a string
+         DECIMAL --- a decimal constant [0-9]+ as a string                                                                                                                  
+    *)
+    ostap (
+      call: f:IDENT "(" args:!(Util.list0 parse) ")" { Call (f, args) } ;
+      primary: call | x:IDENT {Var x} | x:DECIMAL {Const x} | -"(" parse -")";
+      parse: 
+        !(Util.expr
+          (fun x -> x)
+          [|
+            `Lefta, ostap_binop_list ["!!"];
+            `Lefta, ostap_binop_list ["&&"];
+            `Nona,  ostap_binop_list [">="; ">"; "<="; "<"; "=="; "!="];
+            `Lefta, ostap_binop_list ["+"; "-"];
+            `Lefta, ostap_binop_list ["*"; "/"; "%"]
+          |]
+          primary
+        )
+    )
+    
+  end
+                    
+(* Simple statements: syntax and sematics *)
+module Stmt =
+  struct
+
+    (* The type for statements *)
+    @type t =
+    (* read into the variable           *) | Read   of string
+    (* write the value of an expression *) | Write  of Expr.t
+    (* assignment                       *) | Assign of string * Expr.t
+    (* composition                      *) | Seq    of t * t 
+    (* empty statement                  *) | Skip
+    (* conditional                      *) | If     of Expr.t * t * t
+    (* loop with a pre-condition        *) | While  of Expr.t * t
+    (* loop with a post-condition       *) | Repeat of Expr.t * t
+    (* return statement                 *) | Return of Expr.t option
+    (* call a procedure                 *) | Call   of string * Expr.t list with show
+                                                                    
+    (* Statement evaluator
+         val eval : env -> config -> t -> config
+       Takes an environment, a configuration and a statement, and returns another configuration. The 
+       environment is the same as for expressions
+    *)
+    let rec eval env ((st, i, o, r) as conf) k stmt =
+      match stmt with
+      | Assign (x, e) -> 
+        let (st', i', o', Some v) = Expr.eval env conf e in
+        eval env (State.update x v st', i', o', r) Skip k
+      | Read x -> eval env (State.update x (List.hd i) st, List.tl i, o, r) Skip k
+      | Write e -> 
+        let (st', i', o', Some v) = Expr.eval env conf e in
+        eval env (st', i', o @ [v], r) Skip k
+      | Seq (left_st, right_st) -> eval env conf (
+        match k with
+        | Skip -> right_st
+        | _ -> Seq(right_st, k)
+      ) left_st
+      | Skip -> 
+        (match k with
+        | Skip -> conf
+        | _ -> eval env conf Skip k)
+      | If (e, s1, s2) -> 
+        let (st', i', o', Some v) = Expr.eval env conf e in
+        eval env conf k (if v <> 0 then s1 else s2)
+      | While (e, s) -> eval env conf k (If (e, Seq (s, While (e, s)), Skip))
+      | Repeat (e,s) -> eval env conf k (Seq (s, If (e, Skip, Repeat (e, s))))
+      | Call (f, e)  -> eval env (Expr.eval env conf (Expr.Call (f, e))) Skip k
+      | Return e ->
+        (match e with
+        | None -> conf
+        | Some e -> Expr.eval env conf e);;
+         
+    (* Statement parser *)
+    ostap (
+      parse: seq | stmt;
+      stmt: read | write | assign | if_ | while_ | for_ | repeat_ | skip | call | return;
+      read: "read" "(" x:IDENT ")" { Read x };
+      write: "write" "(" e:!(Expr.parse) ")" { Write e };
+      assign: x:IDENT ":=" e:!(Expr.parse) { Assign (x, e) };
+      if_: "if" e:!(Expr.parse) "then" s:parse "fi" {If (e, s, Skip)} 
+         | "if" e:!(Expr.parse) "then" s1:parse else_elif:else_or_elif "fi" {If (e, s1, else_elif)};
+      else_or_elif: else_ | elif_;
+      else_: "else" s:parse {s};
+      elif_: "elif" e:!(Expr.parse) "then" s1:parse s2:else_or_elif {If (e, s1, s2)};
+      while_: "while" e:!(Expr.parse) "do" s:parse "od" {While (e, s)};
+      for_: "for" init:parse "," e:!(Expr.parse) "," s1:parse "do" s2:parse "od" {Seq (init, While (e, Seq(s2, s1)))};
+      repeat_: "repeat" s:parse "until" e:!(Expr.parse) {Repeat (e, s)};
+      skip: "skip" {Skip};
+      call: x:IDENT "(" args:!(Util.list0)[Expr.parse] ")" {Call (x, args)};
+      return: "return" e:!(Expr.parse)? {Return e};
+      seq: left_st:stmt -";" right_st:parse { Seq (left_st, right_st) }
+    )
+      
+  end
+
+(* Function and procedure definitions *)
+module Definition =
+  struct
+
+    (* The type for a definition: name, argument list, local variables, body *)
+    type t = string * (string list * string list * Stmt.t)
+
+    ostap (     
+      arg  : IDENT;
+      parse: %"fun" name:IDENT "(" args:!(Util.list0 arg) ")"
+         locs:(%"local" !(Util.list arg))?
+        "{" body:!(Stmt.parse) "}" {
+        (name, (args, (match locs with None -> [] | Some l -> l), body))
+      }
+    )
+
+  end
+    
+(* The top-level definitions *)
+
+(* The top-level syntax category is a pair of definition list and statement (program body) *)
+type t = Definition.t list * Stmt.t    
+
+(* Top-level evaluator
+     eval : t -> int list -> int list
+   Takes a program and its input stream, and returns the output stream
+*)
+let eval (defs, body) i =
   let module M = Map.Make (String) in
-  let rec make_map m = function
-  | []              -> m
-  | (LABEL l) :: tl -> make_map (M.add l tl m) tl
-  | _ :: tl         -> make_map m tl
+  let m          = List.fold_left (fun m ((name, _) as def) -> M.add name def m) M.empty defs in  
+  let _, _, o, _ =
+    Stmt.eval
+      (object
+         method definition env f args (st, i, o, r) =                                                                      
+           let xs, locs, s      =  snd @@ M.find f m in
+           let st'              = List.fold_left (fun st (x, a) -> State.update x a st) (State.enter st (xs @ locs)) (List.combine xs args) in
+           let st'', i', o', r' = Stmt.eval env (st', i, o, r) Stmt.Skip s in
+           (State.leave st'' st, i', o', r')
+       end)
+      (State.empty, i, [], None)
+      Stmt.Skip
+      body
   in
-  let m = make_map M.empty p in
-  let (_, _, (_, _, o)) = eval (object method labeled l = M.find l m end) ([], [], (State.empty, i, [])) p in o
+  o
 
-(* Stack machine compiler
-     val compile : Language.t -> prg
-   Takes a program in the source language and returns an equivalent program for the
-   stack machine
-*)
-
-
-let rec compileExpr expr = 
-	match expr with
-	| Expr.Const value -> [CONST value]
-	| Expr.Var variable -> [LD variable]
-	| Expr.Binop (operation, left, right) ->
-		compileExpr left @ compileExpr right @ [BINOP operation]
-
-let rec compileControl stmt env = 
-		match stmt with
-	| Stmt.Assign (variable, expr) -> compileExpr expr @ [ST variable], env
-	| Stmt.Read variable -> [READ; ST variable], env
-	| Stmt.Write expr ->	compileExpr expr @ [WRITE], env
-	| Stmt.Seq (left_stmt, right_stmt) -> 
-		let left, env = compileControl left_stmt env in
-		let right, env = compileControl right_stmt env in
-		left @ right, env
-	| Stmt.Skip -> [], env
-	| Stmt.If (expr, th, el) ->
-		let label_else, env = env#generate in 
-		let label_fi, env = env#generate in
-		let th_compile, env = compileControl th env in
-		let el_compile, env = compileControl el env in
-		compileExpr expr @ [CJMP ("z", label_else)] @ th_compile @ [JMP label_fi; LABEL label_else] @ el_compile @ [LABEL label_fi], env
-	| Stmt.While (expr, while_stmt) ->
-		let label_check, env = env#generate in
-		let label_loop, env = env#generate in
-		let while_body, env = compileControl while_stmt env in
-		[JMP label_check; LABEL label_loop] @ while_body @ [LABEL label_check] @ compileExpr expr @ [CJMP ("nz", label_loop)], env
-	| Stmt.Repeat (expr, repeat_stmt) ->
-		let label_loop, env = env#generate in
-		let repeat_body, env = compileControl repeat_stmt env in
-		[LABEL label_loop] @ repeat_body @ compileExpr expr @ [CJMP ("z", label_loop)], env
-	| Stmt.Call (name, args) ->
-		List.concat (List.map compileExpr args) @ [CALL name], env
-
-let compile (defs, stmt) = 
-	let env = 
-		object
-    		val count_label = 0
-    		method generate = "LABEL_" ^ string_of_int count_label, {< count_label = count_label + 1 >}
-  		end in
-	let prog, env = compileControl stmt env in
-	let rec compile_defs env defs =
-		match defs with
-		 | (name, (args, locals, body))::defs' ->
-		 		let body_defs, env = compile_defs env defs' in
-		 		let compile_body, env = compileControl body env in 
-				[LABEL name; BEGIN (args, locals)] @ compile_body @ [END] @ body_defs, env
-		 | [] -> [], env  in
-	let cdefs, _  = compile_defs env defs in 
-	prog @ [END] @ cdefs
+(* Top-level parser *)
+let parse = ostap (!(Definition.parse)* !(Stmt.parse))
