@@ -1,24 +1,7 @@
-open GT       
-open Language
-       
-(* The type for the stack machine instructions *)
-@type insn =
-(* binary operator                 *) | BINOP of string
-(* put a constant on the stack     *) | CONST of int                 
-(* read to stack                   *) | READ
-(* write from stack                *) | WRITE
-(* load a variable to the stack    *) | LD    of string
-(* store a variable from the stack *) | ST    of string
-(* a label                         *) | LABEL of string
-(* unconditional jump              *) | JMP   of string                                                                                                                
-(* conditional jump                *) | CJMP  of string * string
-(* begins procedure definition     *) | BEGIN of string list * string list
-(* end procedure definition        *) | END
-(* calls a procedure               *) | CALL  of string with show
-                                                   
-(* The type for the stack machine program *)                                                               
+
+(* The type for the stack machine program *)
 type prg = insn list
-                            
+
 (* The type for the stack machine configuration: control stack, stack and configuration from statement
    interpreter
  *)
@@ -28,49 +11,36 @@ type config = (prg * State.t) list * int list * Expr.config
      val eval : env -> config -> prg -> config
    Takes an environment, a configuration and a program, and returns a configuration as a result. The
    environment is used to locate a label to jump to (via method env#labeled <label_name>)
-*)                                                  
-let rec eval env cfg prg =
-  match prg with
-  | [] -> cfg
-  | instr::prg_tail ->
-    let (cstack, stack, config) = cfg in
-    let (state, input, output) = config in
-    match instr with
-    | BINOP op ->
-      let (x::y::stack_tail) = stack in
-      eval env (cstack,  Expr.binop op y x ::stack_tail, config) prg_tail
-    | CONST c -> eval env (cstack, c::stack, config) prg_tail
-    | READ -> 
-      let (i::input_tail) = input in 
-      eval env (cstack, i::stack, (state, input_tail, output)) prg_tail
-    | WRITE -> 
-      let (s::stack_tail) = stack in 
-      eval env (cstack, stack_tail, (state, input, output @ [s])) prg_tail
-    | LD x -> eval env (cstack, (State.eval state x)::stack, config) prg_tail
-    | ST x -> 
-      let (s::stack_tail) = stack in
-      eval env (cstack, stack_tail, ((State.update x s state), input, output)) prg_tail
-    | LABEL _ -> eval env cfg prg_tail
-    | JMP label -> eval env cfg (env#labeled label)
-    | CJMP (cond, label)  -> 
-      let (s::stack_tail) = stack in
-      let x = match cond with
-      | "nz" -> s <> 0
-      | "z" -> s = 0 
-      in eval env (cstack, stack_tail, config) (if (x) then (env#labeled label) else prg_tail)
-    | CALL f -> eval env ((prg_tail, state)::cstack, stack, config) @@ env#labeled f
-    | BEGIN (args, xs) ->
-      let rec get_args state = function
-        | a::args, z::stack -> let state', stack' = get_args state (args, stack)
-        in State.update a z state', stack'
-        | [], stack -> state, stack
-      in let state', stack' = get_args (State.enter state @@ args @ xs) (args, stack)
-      in eval env (cstack, stack', (state', input, output)) prg_tail
-    | END ->
-      match cstack with
-      | (prog, s)::cstack' ->
-        eval env (cstack', stack, (State.leave state s, input, output)) prog
-      | [] -> cfg
+*)
+(*let rec eval env ((cstack, stack, ((st, i, o) as c)) as conf) prg = failwith "Not implemented"*)
+
+let rec eval env ((cstack, stack, ((st, i, o) as c)) as conf) = function
+| [] -> conf
+| instruction :: rest_program ->
+   match instruction with
+      | BINOP op ->
+        let y::x::tl_stack = stack
+        in eval env (cstack, (Expr.to_func op x y) :: tl_stack, c) rest_program
+      | READ     -> let z::i'        = i     in eval env (cstack, z::stack, (st, i', o)) rest_program
+      | WRITE    -> let z::tl_stack    = stack in eval env (cstack, tl_stack, (st, i, o @ [z])) rest_program
+      | CONST i  -> eval env (cstack, i::stack, c) rest_program
+      | LD x     -> eval env (cstack, State.eval st x :: stack, c) rest_program
+      | ST x     -> let z::tl_stack    = stack in eval env (cstack, tl_stack, (State.update x z st, i, o)) rest_program
+      | LABEL _ -> eval env conf rest_program
+      | JMP label -> eval env conf (env#labeled label)
+      | CJMP (condition, label) ->
+        let x :: tl_stack = stack in
+        eval env (cstack, tl_stack, c) (if (condition = "nz" && x != 0 || condition = "z" && x = 0)
+                                        then (env#labeled label) else rest_program)
+      | CALL f_name -> eval env ((rest_program, st)::cstack, stack, c) (env#labeled f_name)
+      | BEGIN (args, local_vars) ->
+        let current_state = State.enter st (args @ local_vars) in
+        let (res_state, res_stack) = fold_right (fun arg (st, v::tl_stack) -> (State.update arg v st, tl_stack)) args (current_state, stack) in
+        eval env (cstack, res_stack, (res_state, i, o)) rest_program
+      | END ->
+        match cstack with
+        | [] -> conf
+        | (stmts, s) :: tl_cstack -> eval env (tl_cstack, stack, (State.leave st s, i, o)) stmts
 
 (* Top-level evaluation
      val run : prg -> int list -> int list
@@ -87,54 +57,49 @@ let run p i =
   let m = make_map M.empty p in
   let (_, _, (_, _, o)) = eval (object method labeled l = M.find l m end) ([], [], (State.empty, i, [])) p in o
 
-  let rec compile_expr expr = 
-    match expr with
-    | Expr.Const c -> [CONST c]
-    | Expr.Var x -> [LD x]
-    | Expr.Binop (op, left_expr, right_expr) -> compile_expr left_expr @ compile_expr right_expr @ [BINOP op]
-    | Expr.Call (f, exprs) -> List.fold_left (fun ac e -> compile_expr e @ ac) [] exprs @ [CALL f]
-
-  let env = object 
-    val mutable id = 0
-    method next_label = 
-      id <- (id + 1);
-      "L" ^ string_of_int id
-  end
-
 (* Stack machine compiler
      val compile : Language.t -> prg
    Takes a program in the source language and returns an equivalent program for the
    stack machine
 *)
-let compile (defs, st) = 
-  let rec compile' st =
-    match st with
-    | Stmt.Assign (x, e) -> (compile_expr e) @ [ST x]
-    | Stmt.Read x -> [READ] @ [ST x]
-    | Stmt.Write e -> (compile_expr e) @ [WRITE]
-    | Stmt.Seq (left_st, right_st) -> (compile' left_st) @ (compile' right_st)
+
+let labels =
+  object
+    val mutable count = 0
+    method generate =
+        count <- count + 1;
+        "label_" ^ string_of_int count
+    end
+
+let rec compile_expr expr =
+    match expr with
+    | Expr.Const c -> [CONST c]
+    | Expr.Var v -> [LD v]
+    | Expr.Binop (op, expr1, expr2) -> (compile_expr expr1) @ (compile_expr expr2) @ [BINOP op]
+    | Expr.Call (f_name, args) -> concat (map compile_expr args) @ [CALL f_name]
+
+let rec compile_statements stmts =
+    match stmts with
+    | Stmt.Read name -> [READ;ST name]
+    | Stmt.Write expr -> compile_expr expr @ [WRITE]
+    | Stmt.Assign (name, expr) -> compile_expr expr @ [ST name]
+    | Stmt.Seq (stmt1, stmt2) -> compile_statements stmt1 @ compile_statements stmt2
     | Stmt.Skip -> []
-    | Stmt.If (e, s1, s2) ->
-      let else_label = env#next_label in
-      let end_label = env#next_label in
-      let current_case = compile' s1 in
-      let last_case = compile' s2 in
-      (compile_expr e @ [CJMP ("z", else_label)] @ current_case @ [JMP end_label] @ [LABEL else_label] @ last_case @ [LABEL end_label])
-    | Stmt.While (e, s) ->
-      let end_label = env#next_label in
-      let loop_label = env#next_label in
-      let body = compile' s in
-      ([JMP end_label] @ [LABEL loop_label] @ body @ [LABEL end_label] @ compile_expr e @ [CJMP ("nz", loop_label)])
-    | Stmt.Repeat (e, s) ->
-      let loop_label = env#next_label in
-      let body = compile' s in
-      ([LABEL loop_label] @ body @ compile_expr e @ [CJMP ("z", loop_label)])
-    | Stmt.Return e -> (
-      match e with
-      | None -> [END]
-      | Some expr -> compile_expr expr @ [END]
-    )
-    | Stmt.Call (name, args) -> 
-      List.concat (List.map compile_expr args) @ [CALL name] in
-      let compile_def (name, (args, locals, body)) = [LABEL name; BEGIN (args, locals)] @ compile' body @ [END] in
-      (compile' st @ [END] @ List.concat (List.map compile_def defs))
+    | Stmt.If (cond, th, els) ->
+      let else_start_point = labels#generate in
+      let endif_point = labels#generate in
+      (compile_expr cond) @ [CJMP ("z", else_start_point)] @ (compile_statements th)@ [JMP endif_point; LABEL else_start_point] @ (compile_statements els) @ [LABEL endif_point]
+    | Stmt.While (cond, body) ->
+      let start_point = labels#generate in
+      let end_point = labels#generate in
+      [LABEL start_point] @ (compile_expr cond) @ [CJMP ("z", end_point)] @ (compile_statements body) @ [JMP start_point; LABEL end_point]
+    | Stmt.Repeat (body, cond) ->
+      let start_point = labels#generate in
+      [LABEL start_point] @ (compile_statements body) @ (compile_expr cond) @ [CJMP ("z", start_point)]
+    | Stmt.Call (f_name, args) -> concat (map compile_expr args) @ [CALL f_name]
+    | Stmt.Return maybe_val -> match maybe_val with Some v -> (compile_expr v) @ [END] | _ -> [END]
+
+let compile_definition (f_name, (args, local_vars, body)) = [LABEL f_name; BEGIN (args, local_vars)] @ (compile_statements body) @ [END]
+
+let rec compile (defs, program) =
+  [LABEL "main"] @ (compile_statements program) @ [END] @ (concat (map compile_definition defs))
