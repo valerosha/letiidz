@@ -1,233 +1,254 @@
-(* X86 codegeneration interface *)
-
-(* The registers: *)
-let regs = [|"%ebx"; "%ecx"; "%esi"; "%edi"; "%eax"; "%edx"; "%ebp"; "%esp"|]
-
-(* We can not freely operate with all register; only 3 by now *)                    
-let num_of_regs = Array.length regs - 5
-
-(* We need to know the word size to calculate offsets correctly *)
-let word_size = 4
-
-(* We need to distinguish the following operand types: *)
-type opnd = 
-| R of int     (* hard register                    *)
-| S of int     (* a position on the hardware stack *)
-| M of string  (* a named memory location          *)
-| L of int     (* an immediate operand             *)
-
-(* For convenience we define the following synonyms for the registers: *)         
-let ebx = R 0
-let ecx = R 1
-let esi = R 2
-let edi = R 3
-let eax = R 4
-let edx = R 5
-let ebp = R 6
-let esp = R 7
-
-(* Now x86 instruction (we do not need all of them): *)
-type instr =
-(* copies a value from the first to the second operand  *) | Mov   of opnd * opnd
-(* makes a binary operation; note, the first operand    *) | Binop of string * opnd * opnd
-(* designates x86 operator, not the source language one *)
-(* x86 integer division, see instruction set reference  *) | IDiv  of opnd
-(* see instruction set reference                        *) | Cltd
-(* sets a value from flags; the first operand is the    *) | Set   of string * string
-(* suffix, which determines the value being set, the    *)                     
-(* the second --- (sub)register name                    *)
-(* pushes the operand on the hardware stack             *) | Push  of opnd
-(* pops from the hardware stack to the operand          *) | Pop   of opnd
-(* call a function by a name                            *) | Call  of string
-(* returns from a function                              *) | Ret
-(* a label in the code                                  *) | Label of string
-(* a conditional jump                                   *) | CJmp  of string * string
-(* a non-conditional jump                               *) | Jmp   of string
-                                                               
-(* Instruction printer *)
-let show instr =
-  let binop = function
-  | "+"   -> "addl"
-  | "-"   -> "subl"
-  | "*"   -> "imull"
-  | "&&"  -> "andl"
-  | "!!"  -> "orl" 
-  | "^"   -> "xorl"
-  | "cmp" -> "cmpl"
-  | _     -> failwith "unknown binary operator"
-  in
-  let opnd = function
-  | R i -> regs.(i)
-  | S i -> Printf.sprintf "-%d(%%ebp)" ((i+1) * word_size)
-  | M x -> x
-  | L i -> Printf.sprintf "$%d" i
-  in
-  match instr with
-  | Cltd               -> "\tcltd"
-  | Set   (suf, s)     -> Printf.sprintf "\tset%s\t%s"     suf s
-  | IDiv   s1          -> Printf.sprintf "\tidivl\t%s"     (opnd s1)
-  | Binop (op, s1, s2) -> Printf.sprintf "\t%s\t%s,\t%s"   (binop op) (opnd s1) (opnd s2)
-  | Mov   (s1, s2)     -> Printf.sprintf "\tmovl\t%s,\t%s" (opnd s1) (opnd s2)
-  | Push   s           -> Printf.sprintf "\tpushl\t%s"     (opnd s)
-  | Pop    s           -> Printf.sprintf "\tpopl\t%s"      (opnd s)
-  | Ret                -> "\tret"
-  | Call   p           -> Printf.sprintf "\tcall\t%s" p
-  | Label  l           -> Printf.sprintf "%s:\n" l
-  | Jmp    l           -> Printf.sprintf "\tjmp\t%s" l
-  | CJmp  (s , l)      -> Printf.sprintf "\tj%s\t%s" s l
-
-(* Opening stack machine to use instructions without fully qualified names *)
-open SM
-
-(* Symbolic stack machine evaluator
-     compile : env -> prg -> env * instr list
-   Take an environment, a stack machine program, and returns a pair --- the updated environment and the list
-   of x86 instructions
+(* Opening a library for generic programming (https://github.com/dboulytchev/GT).
+   The library provides "@type ..." syntax extension and plugins like show, etc.
 *)
-let rec compile env code =
+open GT
 
-  let mov x y =
-    match x, y with 
-    | M _, S _ -> [Mov (x, edx); Mov (edx, y)]
-    | S _, S _ -> [Mov (x, edx); Mov (edx, y)]
-    | _, _ -> [Mov (x, y)]
-  in
+(* Opening a library for combinator-based syntax analysis *)
+open Ostap
+open Combinators
+                         
+(* States *)
+module State =
+  struct
+                                                                
+    (* State: global state, local state, scope variables *)
+    type t = {g : string -> int; l : string -> int; scope : string list}
 
-  let rec compile_binop op x y = 
-    match op with
-    | "+" | "-" | "*" -> [Mov (x, eax); Binop (op, y, eax)], eax
+    (* Empty state *)
+    let empty =
+      let e x = failwith (Printf.sprintf "Undefined variable: %s" x) in
+      {g = e; l = e; scope = []}
 
-    | "/" -> [Mov (x, eax); Cltd; IDiv y], eax
-    | "%" -> [Mov (x, eax); Cltd; IDiv y], edx
+    (* Update: non-destructively "modifies" the state s by binding the variable x 
+       to value v and returns the new state w.r.t. a scope
+    *)
+    let update x v s =
+      let u x v s = fun y -> if x = y then v else s y in
+      if List.mem x s.scope then {s with l = u x v s.l} else {s with g = u x v s.g}
 
-    | ">" ->  [Mov (x, edx); Binop ("cmp", y, edx)] @ [Mov (L 0, eax); Set ("g", "%al")],  eax
-    | ">=" -> [Mov (x, edx); Binop ("cmp", y, edx)] @ [Mov (L 0, eax); Set ("ge", "%al")], eax
-    | "<" ->  [Mov (x, edx); Binop ("cmp", y, edx)] @ [Mov (L 0, eax); Set ("l", "%al")],  eax
-    | "<=" -> [Mov (x, edx); Binop ("cmp", y, edx)] @ [Mov (L 0, eax); Set ("le", "%al")], eax
-    | "==" -> [Mov (x, edx); Binop ("cmp", y, edx)] @ [Mov (L 0, eax); Set ("e", "%al")],  eax
-    | "!=" -> [Mov (x, edx); Binop ("cmp", y, edx)] @ [Mov (L 0, eax); Set ("ne", "%al")], eax
+    (* Evals a variable in a state w.r.t. a scope *)
+    let eval s x = (if List.mem x s.scope then s.l else s.g) x
 
-    | "!!" -> [Mov (x, edx); Binop ("!!", y, edx)] @ [Mov (L 0, eax); Set ("nz", "%al")], eax
+    (* Creates a new scope, based on a given state *)
+    let enter st xs = {empty with g = st.g; scope = xs}
 
-    | "&&" -> 
-      let ne_x, reg_x = compile_binop "!=" x (L 0)
-      and ne_y, reg_y = compile_binop "!=" y (L 0) in
-      ne_x @ [Mov (reg_x, x)] @ ne_y @ [Mov (reg_y, y)] @ [Mov (y, edx); Binop ("&&", x, edx)] @ [Mov (L 0, eax); Set ("nz", "%al")], eax
-  in
+    (* Drops a scope *)
+    let leave st st' = {st' with g = st.g}
 
-  match code with
-  | [] -> (env, [])
-  | instr::code' ->
-    let env', asm = 
-      match instr with
-      | CONST n ->
-        let s, env = env#allocate in
-        (env, mov (L n) s)
-      | READ ->
-        let s, env = env#allocate in
-        (env, [Call "Lread"] @ mov eax s)
-      | WRITE ->
-        let s, env = env#pop in
-        (env, [Push s; Call "Lwrite"; Pop edx])
-      | LD x ->
-        let s, env = env#allocate in
-        (env, mov (M (env#loc x)) s)
-      | ST x ->
-        let s, env = (env#global x)#pop in
-        (env, mov s (M (env#loc x)))
-      | BINOP op ->
-        let y, x, env = env#pop2 in
-        let s, env = env#allocate
-        and asm', acc = compile_binop op x y in
-        (env, asm' @ (mov acc s))      
-      | LABEL l -> env, [Label l]
-      | JMP l -> env, [Jmp l]
-      | CJMP (c, l) -> let o, env = env#pop in env, [Binop ("cmp", L 0, o); CJmp (c, l)]
-    in
-    let env, asm' = compile env' code' in
-    (env, asm @ asm');;
+  end
+    
+(* Simple expressions: syntax and semantics *)
+module Expr =
+  struct
+    
+    (* The type for expressions. Note, in regular OCaml there is no "@type..." 
+       notation, it came from GT. 
+    *)
+    @type t =
+    (* integer constant *) | Const of int
+    (* variable         *) | Var   of string
+    (* binary operator  *) | Binop of string * t * t
+    (* function call    *) | Call  of string * t list with show
 
-(* A set of strings *)           
-module S = Set.Make (String)
+    (* Available binary operators:
+        !!                   --- disjunction
+        &&                   --- conjunction
+        ==, !=, <=, <, >=, > --- comparisons
+        +, -                 --- addition, subtraction
+        *, /, %              --- multiplication, division, reminder
+    *)
 
-(* Environment implementation *)
-class env =
-  object (self)
-    val stack_slots = 0        (* maximal number of stack positions *)
-    val globals     = S.empty  (* a set of global variables         *)
-    val stack       = []       (* symbolic stack                    *)
+    (* The type of configuration: a state, an input stream, an output stream, an optional value *)
+    type config = State.t * int list * int list * int option
+                          
+    let binop op left_expr_eval right_expr_eval =
+      match op with
+      | "+" -> left_expr_eval + right_expr_eval
+      | "-" -> left_expr_eval - right_expr_eval
+      | "*" -> left_expr_eval * right_expr_eval
+      | "/" -> left_expr_eval / right_expr_eval
+      | "%" -> left_expr_eval mod right_expr_eval
+      | ">" -> if (left_expr_eval > right_expr_eval) then 1 else 0
+      | "<" -> if (left_expr_eval < right_expr_eval) then 1 else 0
+      | "<=" -> if (left_expr_eval <= right_expr_eval) then 1 else 0
+      | ">=" -> if (left_expr_eval >= right_expr_eval) then 1 else 0
+      | "==" -> if (left_expr_eval = right_expr_eval) then 1 else 0
+      | "!=" -> if (left_expr_eval <> right_expr_eval) then 1 else 0
+      | "&&" -> if ((left_expr_eval <> 0) && (right_expr_eval <> 0)) then 1 else 0
+      | "!!" -> if ((left_expr_eval <> 0) || (right_expr_eval <> 0)) then 1 else 0
 
-    (* gets a name for a global variable *)
-    method loc x = "global_" ^ x                                 
+    (* Expression evaluator
+          val eval : env -> config -> t -> config
+       Takes an environment, a configuration and an expresion, and returns another configuration. The 
+       environment supplies the following method
+           method definition : env -> string -> int list -> config -> config
+       which takes an environment (of the same type), a name of the function, a list of actual parameters and a configuration, 
+       an returns resulting configuration
+    *)                                                       
+    let rec eval env ((st, i, o, r) as conf) expr =
+      match expr with
+      | Const c -> (st, i, o, Some c)
+      | Var x -> (st, i, o, Some (State.eval st x))
+      | Binop(op, left_expr, right_expr) ->
+        let (_, _, _, Some left_expr_eval) as conf' = eval env conf left_expr in
+        let (st', i', o', Some right_expr_eval) = eval env conf' right_expr in
+          (st', i', o', Some (binop op left_expr_eval right_expr_eval))
+      | Call (name, args) -> (
+        let v_args, conf' =
+          List.fold_left (
+            fun (acc, conf) e -> 
+              let (_, _, _, Some v) as conf' = eval env conf e in 
+              v::acc, conf'
+          ) ([], conf) args
+        in
+        env#definition env name (List.rev v_args) conf'  
+      )
 
-    (* allocates a fresh position on a symbolic stack *)
-    method allocate =    
-      let x, n =
-	let rec allocate' = function
-	| []                            -> ebx     , 0
-	| (S n)::_                      -> S (n+1) , n+1
-	| (R n)::_ when n < num_of_regs -> R (n+1) , stack_slots
-        | (M _)::s                      -> allocate' s
-	| _                             -> S 0     , 1
-	in
-	allocate' stack
-      in
-      x, {< stack_slots = max n stack_slots; stack = x::stack >}
+    let ostap_binop_list op_list = 
+      let ostap_binop op = (ostap ($(op)), fun x y -> Binop (op, x, y)) in 
+      List.map ostap_binop op_list;; 
+         
+    (* Expression parser. You can use the following terminals:
+         IDENT   --- a non-empty identifier a-zA-Z[a-zA-Z0-9_]* as a string
+         DECIMAL --- a decimal constant [0-9]+ as a string                                                                                                                  
+    *)
+    ostap (
+      call: f:IDENT "(" args:!(Util.list0 parse) ")" { Call (f, args) } ;
+      primary: call | x:IDENT {Var x} | x:DECIMAL {Const x} | -"(" parse -")";
+      parse: 
+        !(Util.expr
+          (fun x -> x)
+          [|
+            `Lefta, ostap_binop_list ["!!"];
+            `Lefta, ostap_binop_list ["&&"];
+            `Nona,  ostap_binop_list [">="; ">"; "<="; "<"; "=="; "!="];
+            `Lefta, ostap_binop_list ["+"; "-"];
+            `Lefta, ostap_binop_list ["*"; "/"; "%"]
+          |]
+          primary
+        )
+    )
+    
+  end
+                    
+(* Simple statements: syntax and sematics *)
+module Stmt =
+  struct
 
-    (* pushes an operand to the symbolic stack *)
-    method push y = {< stack = y::stack >}
-
-    (* pops one operand from the symbolic stack *)
-    method pop  = let x::stack' = stack in x, {< stack = stack' >}
-
-    (* pops two operands from the symbolic stack *)
-    method pop2 = let x::y::stack' = stack in x, y, {< stack = stack' >}
-
-    (* registers a global variable in the environment *)
-    method global x  = {< globals = S.add ("global_" ^ x) globals >}
-
-    (* gets the number of allocated stack slots *)
-    method allocated = stack_slots
-
-    (* gets all global variables *)      
-    method globals = S.elements globals
+    (* The type for statements *)
+    @type t =
+    (* read into the variable           *) | Read   of string
+    (* write the value of an expression *) | Write  of Expr.t
+    (* assignment                       *) | Assign of string * Expr.t
+    (* composition                      *) | Seq    of t * t 
+    (* empty statement                  *) | Skip
+    (* conditional                      *) | If     of Expr.t * t * t
+    (* loop with a pre-condition        *) | While  of Expr.t * t
+    (* loop with a post-condition       *) | Repeat of Expr.t * t
+    (* return statement                 *) | Return of Expr.t option
+    (* call a procedure                 *) | Call   of string * Expr.t list with show
+                                                                    
+    (* Statement evaluator
+         val eval : env -> config -> t -> config
+       Takes an environment, a configuration and a statement, and returns another configuration. The 
+       environment is the same as for expressions
+    *)
+    let rec eval env ((st, i, o, r) as conf) k stmt =
+      match stmt with
+      | Assign (x, e) -> 
+        let (st', i', o', Some v) = Expr.eval env conf e in
+        eval env (State.update x v st', i', o', r) Skip k
+      | Read x -> eval env (State.update x (List.hd i) st, List.tl i, o, r) Skip k
+      | Write e -> 
+        let (st', i', o', Some v) = Expr.eval env conf e in
+        eval env (st', i', o @ [v], r) Skip k
+      | Seq (left_st, right_st) -> eval env conf (
+        match k with
+        | Skip -> right_st
+        | _ -> Seq(right_st, k)
+      ) left_st
+      | Skip -> 
+        (match k with
+        | Skip -> conf
+        | _ -> eval env conf Skip k)
+      | If (e, s1, s2) -> 
+        let (st', i', o', Some v) = Expr.eval env conf e in
+        eval env conf k (if v <> 0 then s1 else s2)
+      | While (e, s) -> eval env conf k (If (e, Seq (s, While (e, s)), Skip))
+      | Repeat (e,s) -> eval env conf k (Seq (s, If (e, Skip, Repeat (e, s))))
+      | Call (f, e)  -> eval env (Expr.eval env conf (Expr.Call (f, e))) Skip k
+      | Return e ->
+        (match e with
+        | None -> conf
+        | Some e -> Expr.eval env conf e);;
+         
+    (* Statement parser *)
+    ostap (
+      parse: seq | stmt;
+      stmt: read | write | assign | if_ | while_ | for_ | repeat_ | skip | call | return;
+      read: "read" "(" x:IDENT ")" { Read x };
+      write: "write" "(" e:!(Expr.parse) ")" { Write e };
+      assign: x:IDENT ":=" e:!(Expr.parse) { Assign (x, e) };
+      if_: "if" e:!(Expr.parse) "then" s:parse "fi" {If (e, s, Skip)} 
+         | "if" e:!(Expr.parse) "then" s1:parse else_elif:else_or_elif "fi" {If (e, s1, else_elif)};
+      else_or_elif: else_ | elif_;
+      else_: "else" s:parse {s};
+      elif_: "elif" e:!(Expr.parse) "then" s1:parse s2:else_or_elif {If (e, s1, s2)};
+      while_: "while" e:!(Expr.parse) "do" s:parse "od" {While (e, s)};
+      for_: "for" init:parse "," e:!(Expr.parse) "," s1:parse "do" s2:parse "od" {Seq (init, While (e, Seq(s2, s1)))};
+      repeat_: "repeat" s:parse "until" e:!(Expr.parse) {Repeat (e, s)};
+      skip: "skip" {Skip};
+      call: x:IDENT "(" args:!(Util.list0)[Expr.parse] ")" {Call (x, args)};
+      return: "return" e:!(Expr.parse)? {Return e};
+      seq: left_st:stmt -";" right_st:parse { Seq (left_st, right_st) }
+    )
+      
   end
 
-(* Compiles a unit: generates x86 machine code for the stack program and surrounds it
-   with function prologue/epilogue
-*)
-let compile_unit env scode =  
-  let env, code = compile env scode in
-  env, 
-  ([Push ebp; Mov (esp, ebp); Binop ("-", L (word_size*env#allocated), esp)] @ 
-   code @
-   [Mov (ebp, esp); Pop ebp; Binop ("^", eax, eax); Ret]
-  )
+(* Function and procedure definitions *)
+module Definition =
+  struct
 
-(* Generates an assembler text for a program: first compiles the program into
-   the stack code, then generates x86 assember code, then prints the assembler file
-*)
-let genasm prog =
-  let env, code = compile_unit (new env) (SM.compile prog) in
-  let asm = Buffer.create 1024 in
-  Buffer.add_string asm "\t.data\n";
-  List.iter
-    (fun s ->
-       Buffer.add_string asm (Printf.sprintf "%s:\t.int\t0\n" s)
+    (* The type for a definition: name, argument list, local variables, body *)
+    type t = string * (string list * string list * Stmt.t)
+
+    ostap (     
+      arg  : IDENT;
+      parse: %"fun" name:IDENT "(" args:!(Util.list0 arg) ")"
+         locs:(%"local" !(Util.list arg))?
+        "{" body:!(Stmt.parse) "}" {
+        (name, (args, (match locs with None -> [] | Some l -> l), body))
+      }
     )
-    env#globals;
-  Buffer.add_string asm "\t.text\n";
-  Buffer.add_string asm "\t.globl\tmain\n";
-  Buffer.add_string asm "main:\n";
-  List.iter
-    (fun i -> Buffer.add_string asm (Printf.sprintf "%s\n" @@ show i))
-    code;
-  Buffer.contents asm
 
-(* Builds a program: generates the assembler file and compiles it with the gcc toolchain *)
-let build stmt name =
-  let outf = open_out (Printf.sprintf "%s.s" name) in
-  Printf.fprintf outf "%s" (genasm stmt);
-  close_out outf;
-  let inc = try Sys.getenv "RC_RUNTIME" with _ -> "../runtime" in
-  Sys.command (Printf.sprintf "gcc -m32 -o %s %s/runtime.o %s.s" name inc name)
+  end
+    
+(* The top-level definitions *)
+
+(* The top-level syntax category is a pair of definition list and statement (program body) *)
+type t = Definition.t list * Stmt.t    
+
+(* Top-level evaluator
+     eval : t -> int list -> int list
+   Takes a program and its input stream, and returns the output stream
+*)
+let eval (defs, body) i =
+  let module M = Map.Make (String) in
+  let m          = List.fold_left (fun m ((name, _) as def) -> M.add name def m) M.empty defs in  
+  let _, _, o, _ =
+    Stmt.eval
+      (object
+         method definition env f args (st, i, o, r) =                                                                      
+           let xs, locs, s      =  snd @@ M.find f m in
+           let st'              = List.fold_left (fun st (x, a) -> State.update x a st) (State.enter st (xs @ locs)) (List.combine xs args) in
+           let st'', i', o', r' = Stmt.eval env (st', i, o, r) Stmt.Skip s in
+           (State.leave st'' st, i', o', r')
+       end)
+      (State.empty, i, [], None)
+      Stmt.Skip
+      body
+  in
+  o
+
+(* Top-level parser *)
+let parse = ostap (!(Definition.parse)* !(Stmt.parse))
