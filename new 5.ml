@@ -105,12 +105,6 @@ let compile env code =
     | instr :: scode' ->
       let env', code' =
         match instr with
-        | READ ->
-          let s, env' = env#allocate in
-          (env', [Call "Lread"; Mov (eax, s)])               
-        | WRITE ->
-          let s, env' = env#pop in
-          (env', [Push s; Call "Lwrite"; Pop eax])
         | CONST n ->
           let s, env' = env#allocate in
           (env', [Mov (L n, s)])               
@@ -232,7 +226,7 @@ let compile env code =
       env'', code' @ code''
   in
   compile' env code
-                                
+
 (* A set of strings *)           
 module S = Set.Make (String)
 
@@ -265,7 +259,7 @@ class env =
       let x, n =
 	let rec allocate' = function
 	| []                            -> ebx     , 0
-	| (S n)::_                      -> S (n+1) , n+1
+	| (S n)::_                      -> S (n+1) , n+2
 	| (R n)::_ when n < num_of_regs -> R (n+1) , stack_slots
         | (M _)::s                      -> allocate' s
 	| _                             -> S 0     , 1
@@ -305,7 +299,7 @@ class env =
     (* returns a list of live registers *)
     method live_registers =
       List.filter (function R _ -> true | _ -> false) stack
-      
+       
   end
   
 (* Generates an assembler text for a program: first compiles the program into
